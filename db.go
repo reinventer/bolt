@@ -1,9 +1,13 @@
 package bolt
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"os"
 	"runtime"
@@ -18,7 +22,7 @@ import (
 const maxMmapStep = 1 << 30 // 1GB
 
 // The data file format version.
-const version = 2
+const version = 100
 
 // Represents a marker value to indicate that a file is a Bolt DB.
 const magic uint32 = 0xED0CDAED
@@ -127,6 +131,11 @@ type DB struct {
 	// Read only mode.
 	// When true, Update() and Begin(true) return ErrDatabaseReadOnly immediately.
 	readOnly bool
+
+	// cipher block for encrypt/decrypt
+	block cipher.Block
+	//encrypterStream cipher.Stream
+	//decrypterStream cipher.Stream
 }
 
 // Path returns the path to currently open database file.
@@ -189,7 +198,11 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	}
 
 	// Default values for test hooks
-	db.ops.writeAt = db.file.WriteAt
+	db.ops.writeAt = db.writeAt
+	db.block, err = aes.NewCipher(options.EncryptionKey)
+	if err != nil {
+		return nil, err
+	}
 
 	// Initialize the database if it doesn't exist.
 	if info, err := db.file.Stat(); err != nil {
@@ -237,7 +250,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	db.freelist.read(db.page(db.meta().freelist))
 
 	// Mark the database as opened and return.
-	return db, nil
+	return db, err
 }
 
 // mmap opens the underlying memory-mapped file and initializes the meta references.
@@ -344,6 +357,12 @@ func (db *DB) init() error {
 	// Set the page size to the OS page size.
 	db.pageSize = os.Getpagesize()
 
+	// Random bytes in initialization vector for aes encryption
+	var iv [aes.BlockSize]byte
+	if _, err := io.ReadFull(rand.Reader, iv[:]); err != nil {
+		return err
+	}
+
 	// Create two meta pages on a buffer.
 	buf := make([]byte, db.pageSize*4)
 	for i := 0; i < 2; i++ {
@@ -361,6 +380,7 @@ func (db *DB) init() error {
 		m.pgid = 4
 		m.txid = txid(i)
 		m.checksum = m.sum64()
+		m.iv = iv
 	}
 
 	// Write an empty freelist at page 3.
@@ -376,7 +396,11 @@ func (db *DB) init() error {
 	p.count = 0
 
 	// Write the buffer to our data file.
-	if _, err := db.ops.writeAt(buf, 0); err != nil {
+	if _, err := db.file.WriteAt(buf[:2*db.pageSize], 0); err != nil {
+		return err
+	}
+
+	if _, err := writeAt(buf[2*db.pageSize:], int64(2*db.pageSize), db.block, iv[:], db.file, db.pageSize); err != nil {
 		return err
 	}
 	if err := fdatasync(db); err != nil {
@@ -793,7 +817,18 @@ func (db *DB) Info() *Info {
 // page retrieves a page reference from the mmap based on the current page size.
 func (db *DB) page(id pgid) *page {
 	pos := id * pgid(db.pageSize)
-	return (*page)(unsafe.Pointer(&db.data[pos]))
+	if id < 2 { // return meta pages without encryption
+		return (*page)(unsafe.Pointer(&db.data[pos]))
+	}
+
+	pg := make([]byte, db.pageSize)
+	copy(pg, db.data[pos:])
+
+	// XORKeyStream can work in-place if the two arguments are the same.
+	decrypterStream := cipher.NewCFBDecrypter(db.block, db.meta().iv[:])
+	decrypterStream.XORKeyStream(pg, pg)
+
+	return (*page)(unsafe.Pointer(&pg))
 }
 
 // pageInBuffer retrieves a page reference from a given byte array based on the current page size.
@@ -893,6 +928,19 @@ func (db *DB) IsReadOnly() bool {
 	return db.readOnly
 }
 
+func (db *DB) writeAt(b []byte, off int64) (int, error) {
+	return writeAt(b, off, db.block, db.meta().iv[:], db.file, db.pageSize)
+}
+
+func writeAt(b []byte, off int64, block cipher.Block, iv []byte, file *os.File, dbPageSize int) (int, error) {
+	// aes encryption
+	for ptr := 0; ptr < len(b); ptr += dbPageSize {
+		encrypterStream := cipher.NewCFBEncrypter(block, iv)
+		encrypterStream.XORKeyStream(b[ptr:ptr+dbPageSize], b[ptr:ptr+dbPageSize])
+	}
+	return file.WriteAt(b, off)
+}
+
 // Options represents the options that can be set when opening a database.
 type Options struct {
 	// Timeout is the amount of time to wait to obtain a file lock.
@@ -919,6 +967,9 @@ type Options struct {
 	// If initialMmapSize is smaller than the previous database size,
 	// it takes no effect.
 	InitialMmapSize int
+
+	// Encryption key
+	EncryptionKey []byte
 }
 
 // DefaultOptions represent the options used if nil options are passed into Open().
@@ -979,6 +1030,7 @@ type meta struct {
 	pgid     pgid
 	txid     txid
 	checksum uint64
+	iv       [aes.BlockSize]byte
 }
 
 // validate checks the marker bytes and version of the meta page to ensure it matches this binary.

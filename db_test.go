@@ -19,13 +19,14 @@ import (
 	"time"
 	"unsafe"
 
+	"crypto/aes"
 	"github.com/boltdb/bolt"
 )
 
 var statsFlag = flag.Bool("stats", false, "show performance stats")
 
 // version is the data file format version.
-const version = 2
+const version = 100
 
 // magic is the marker value to indicate that a file is a Bolt DB.
 const magic uint32 = 0xED0CDAED
@@ -47,6 +48,7 @@ type meta struct {
 	pgid     uint64
 	_        uint64
 	checksum uint64
+	vi       [aes.BlockSize]byte
 }
 
 // Ensure that a database can be opened without error.
