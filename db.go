@@ -395,15 +395,16 @@ func (db *DB) init() error {
 	p.flags = leafPageFlag
 	p.count = 0
 
+	if err := fdatasync(db); err != nil {
+		return err
+	}
+
 	// Write the buffer to our data file.
 	if _, err := db.file.WriteAt(buf[:2*db.pageSize], 0); err != nil {
 		return err
 	}
 
 	if _, err := writeAt(buf[2*db.pageSize:], int64(2*db.pageSize), db.block, iv[:], db.file, db.pageSize); err != nil {
-		return err
-	}
-	if err := fdatasync(db); err != nil {
 		return err
 	}
 
@@ -822,13 +823,13 @@ func (db *DB) page(id pgid) *page {
 	}
 
 	pg := make([]byte, db.pageSize)
-	copy(pg, db.data[pos:])
+	copy(pg, db.data[pos:int(pos)+db.pageSize])
 
 	// XORKeyStream can work in-place if the two arguments are the same.
 	decrypterStream := cipher.NewCFBDecrypter(db.block, db.meta().iv[:])
 	decrypterStream.XORKeyStream(pg, pg)
 
-	return (*page)(unsafe.Pointer(&pg))
+	return (*page)(unsafe.Pointer(&pg[0]))
 }
 
 // pageInBuffer retrieves a page reference from a given byte array based on the current page size.
@@ -934,9 +935,11 @@ func (db *DB) writeAt(b []byte, off int64) (int, error) {
 
 func writeAt(b []byte, off int64, block cipher.Block, iv []byte, file *os.File, dbPageSize int) (int, error) {
 	// aes encryption
-	for ptr := 0; ptr < len(b); ptr += dbPageSize {
-		encrypterStream := cipher.NewCFBEncrypter(block, iv)
-		encrypterStream.XORKeyStream(b[ptr:ptr+dbPageSize], b[ptr:ptr+dbPageSize])
+	if off >= 2*int64(dbPageSize) {
+		for ptr := 0; ptr < len(b); ptr += dbPageSize {
+			encrypterStream := cipher.NewCFBEncrypter(block, iv)
+			encrypterStream.XORKeyStream(b[ptr:ptr+dbPageSize], b[ptr:ptr+dbPageSize])
+		}
 	}
 	return file.WriteAt(b, off)
 }
