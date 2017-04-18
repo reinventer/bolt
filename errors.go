@@ -26,6 +26,9 @@ var (
 	// ErrTimeout is returned when a database cannot obtain an exclusive lock
 	// on the data file after the timeout passed to Open().
 	ErrTimeout = errors.New("timeout")
+
+	// ErrKeyMismatch is returned when encryption key mismatch
+	ErrKeyMismatch = errors.New("encryption key mismatch")
 )
 
 // These errors can occur when beginning or committing a Tx.

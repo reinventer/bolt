@@ -3,6 +3,7 @@ package bolt
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/md5"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -134,8 +135,6 @@ type DB struct {
 
 	// cipher block for encrypt/decrypt
 	block cipher.Block
-	//encrypterStream cipher.Stream
-	//decrypterStream cipher.Stream
 }
 
 // Path returns the path to currently open database file.
@@ -243,6 +242,11 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	if err := db.mmap(options.InitialMmapSize); err != nil {
 		_ = db.close()
 		return nil, err
+	}
+
+	// Validate Encryption Key
+	if db.meta().keysum != keysum(db.block, db.meta().iv) {
+		return nil, ErrKeyMismatch
 	}
 
 	// Read in the freelist.
@@ -363,6 +367,8 @@ func (db *DB) init() error {
 		return err
 	}
 
+	ks := keysum(db.block, iv)
+
 	// Create two meta pages on a buffer.
 	buf := make([]byte, db.pageSize*4)
 	for i := 0; i < 2; i++ {
@@ -379,8 +385,9 @@ func (db *DB) init() error {
 		m.root = bucket{root: 3}
 		m.pgid = 4
 		m.txid = txid(i)
-		m.checksum = m.sum64()
 		m.iv = iv
+		m.keysum = ks
+		m.checksum = m.sum64()
 	}
 
 	// Write an empty freelist at page 3.
@@ -1032,8 +1039,9 @@ type meta struct {
 	freelist pgid
 	pgid     pgid
 	txid     txid
-	checksum uint64
 	iv       [aes.BlockSize]byte
+	keysum   [md5.Size]byte
+	checksum uint64
 }
 
 // validate checks the marker bytes and version of the meta page to ensure it matches this binary.
@@ -1076,6 +1084,12 @@ func (m *meta) sum64() uint64 {
 	var h = fnv.New64a()
 	_, _ = h.Write((*[unsafe.Offsetof(meta{}.checksum)]byte)(unsafe.Pointer(m))[:])
 	return h.Sum64()
+}
+
+func keysum(block cipher.Block, iv [aes.BlockSize]byte) (k [aes.BlockSize]byte) {
+	stream := cipher.NewCFBEncrypter(block, iv[:])
+	stream.XORKeyStream(k[:], iv[:])
+	return
 }
 
 // _assert will panic with a given formatted message if the given condition is false.
